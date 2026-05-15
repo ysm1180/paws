@@ -47,4 +47,14 @@ type transferDoneMsg struct {
 
 type browserClosedMsg struct{}
 
+// transferShellReopenedMsg delivers a freshly opened transfer ShellSession
+// back to Update after a cancel. The cancel watchdog in StreamRemoteFileBase64
+// closes stdin to unblock a stuck Peek, which permanently poisons that
+// session — without a reopen path, every download after the first cancel
+// fails with "shell session closed".
+type transferShellReopenedMsg struct {
+	sh  *aws.ShellSession
+	err error
+}
+
 type tickMsg struct{}

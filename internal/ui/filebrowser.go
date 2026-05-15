@@ -116,7 +116,11 @@ func (m *Model) handleBrowserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if j := m.tm.ActiveJob(s.instance.ID); j != nil {
 			j.Cancel()
 			s.statusMsg = "Transfer cancelled"
-			return m, nil
+			// The cancel watchdog in StreamRemoteFileBase64 will close
+			// the transfer shell's stdin to unblock its Peek; that
+			// permanently poisons the session, so spin up a fresh one
+			// in the background to keep subsequent downloads working.
+			return m, m.reopenTransferShellCmd()
 		}
 		return m, func() tea.Msg { return browserClosedMsg{} }
 	case key.Matches(msg, Keys.Up):
@@ -175,6 +179,11 @@ func (m *Model) cdCmd(absPath string) tea.Cmd {
 func (m *Model) startDownloadCmd(file aws.RemoteEntry, localPath string) tea.Cmd {
 	if m.browser == nil {
 		return nil
+	}
+	if m.transferShell == nil {
+		return func() tea.Msg {
+			return logMsg{"error", "transfer session reopening, retry in a moment"}
+		}
 	}
 	remoteAbs := path.Join(m.browser.cwd, file.Name)
 	instanceID := m.browser.instance.ID

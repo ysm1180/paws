@@ -145,17 +145,29 @@ func (b *boundedReader) Read(p []byte) (int, error) {
 	if b.done {
 		return 0, io.EOF
 	}
-	window := len(p) + len(b.end)
-	if window > 64*1024 {
-		window = 64 * 1024
-	}
-	chunk, err := b.r.Peek(window)
-	if len(chunk) == 0 {
-		if err == nil {
-			return 0, nil
+	// bufio.Reader.Peek(n) blocks until n bytes are buffered (or the
+	// underlying reader errors). Asking for a large window — e.g. p's full
+	// length — deadlocks near the end of a file: the remote shell stops
+	// producing bytes once base64 + the sentinel + a trailing newline are
+	// sent, so a Peek waiting for ~48K can never be satisfied. Peek only
+	// enough bytes to make sentinel detection unambiguous, then use
+	// Buffered() to pull whatever else is already sitting in the buffer.
+	if _, err := b.r.Peek(len(b.end)); err != nil {
+		if avail := b.r.Buffered(); avail > 0 {
+			out := make([]byte, avail)
+			peeked, _ := b.r.Peek(avail)
+			copy(out, peeked)
+			_, _ = b.r.Discard(avail)
+			b.truncated = true
+			n := copy(p, out)
+			if n < len(out) {
+				return n, io.ErrShortBuffer
+			}
+			return n, nil
 		}
 		return 0, errTruncated
 	}
+	chunk, _ := b.r.Peek(b.r.Buffered())
 	if idx := bytes.Index(chunk, b.end); idx >= 0 {
 		out := make([]byte, idx)
 		copy(out, chunk[:idx])
@@ -173,19 +185,9 @@ func (b *boundedReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	}
-	if err != nil {
-		out := make([]byte, len(chunk))
-		copy(out, chunk)
-		if _, derr := b.r.Discard(len(chunk)); derr != nil {
-			return 0, derr
-		}
-		b.truncated = true
-		n := copy(p, out)
-		if n < len(out) {
-			return n, io.ErrShortBuffer
-		}
-		return n, nil
-	}
+	// No sentinel in the buffered chunk. Hand back everything except the
+	// trailing len(end)-1 bytes — those might be the prefix of a sentinel
+	// that will complete on the next Peek.
 	safe := len(chunk) - (len(b.end) - 1)
 	if safe < 1 {
 		bbyte, rerr := b.r.ReadByte()

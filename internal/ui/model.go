@@ -245,6 +245,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenList
 		m.browser = nil
 
+	case transferShellReopenedMsg:
+		if msg.err != nil {
+			m.addLog("error", fmt.Sprintf("reopen transfer session: %v", msg.err))
+		} else {
+			m.transferShell = msg.sh
+		}
+
 	case tickMsg:
 		return m, tickEvery()
 
@@ -1216,6 +1223,35 @@ func (m *Model) openBrowserCmd() tea.Cmd {
 			cwd:      cwd,
 			entries:  entries,
 		}
+	}
+}
+
+// reopenTransferShellCmd tears down the current transfer session (which is
+// usually in a poisoned state after a cancel) and starts a fresh one. The
+// new shell is delivered via transferShellReopenedMsg so Update is the
+// only place that assigns m.transferShell.
+func (m *Model) reopenTransferShellCmd() tea.Cmd {
+	if m.browser == nil {
+		return nil
+	}
+	old := m.transferShell
+	m.transferShell = nil
+	instanceID := m.browser.instance.ID
+	parentCtx := m.ctx
+	client := m.awsClient
+	return func() tea.Msg {
+		if old != nil {
+			id := old.SessionID()
+			_ = old.Close()
+			_ = client.TerminateSession(parentCtx, id)
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
+		defer cancel()
+		sh, err := client.StartShellSession(ctx, instanceID)
+		if err != nil {
+			return transferShellReopenedMsg{err: err}
+		}
+		return transferShellReopenedMsg{sh: sh}
 	}
 }
 
