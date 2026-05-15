@@ -14,6 +14,8 @@ type KeyMap struct {
 	Disconnect key.Binding
 	Refresh    key.Binding
 	Quit       key.Binding
+	Back       key.Binding
+	PathBar    key.Binding
 }
 
 var Keys = KeyMap{
@@ -28,4 +30,6 @@ var Keys = KeyMap{
 	Disconnect: key.NewBinding(key.WithKeys("d")),
 	Refresh:    key.NewBinding(key.WithKeys("r")),
 	Quit:       key.NewBinding(key.WithKeys("q", "ctrl+c")),
+	Back:       key.NewBinding(key.WithKeys("backspace", "h", "left")),
+	PathBar:    key.NewBinding(key.WithKeys(":")),
 }

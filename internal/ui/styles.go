@@ -35,7 +35,7 @@ var (
 
 	ListItemStyle = lipgloss.NewStyle().
 		Foreground(ColorFg).
-		PaddingLeft(2)
+		PaddingLeft(1)
 
 	ListItemSelectedStyle = lipgloss.NewStyle().
 		Foreground(ColorFg).
@@ -46,7 +46,7 @@ var (
 	ListItemActiveStyle = lipgloss.NewStyle().
 		Foreground(ColorGreen).
 		Bold(true).
-		PaddingLeft(2)
+		PaddingLeft(1)
 
 	TabActiveStyle = lipgloss.NewStyle().
 		Bold(true).
@@ -77,6 +77,18 @@ var (
 
 	InputFocusedStyle = InputStyle.Copy().
 		BorderForeground(ColorGreen)
+
+	// InlineInputStyle replaces the bordered InputStyle when the input sits
+	// inline with a label. The rounded border renders as a 3-row box that
+	// breaks single-row layouts ("Port: <input>"); this variant stays 1 row.
+	InlineInputStyle = lipgloss.NewStyle().
+		Foreground(ColorFg).
+		Background(ColorSelected).
+		Padding(0, 1)
+
+	InlineInputFocusedStyle = InlineInputStyle.Copy().
+		Foreground(ColorGreen).
+		Bold(true)
 
 	StatusConnectedStyle = lipgloss.NewStyle().
 		Foreground(ColorGreen).
@@ -149,4 +161,18 @@ const (
 	IconDatabase     = "◆"
 	IconCache        = "◈"
 	IconServer       = "■"
+	IconFolder       = "📁"
+	IconFile         = "📄"
+	IconLink         = "🔗"
+	IconDownload     = "⬇"
+)
+
+// Chrome layout row costs, in terminal rows. renderFullView's height math
+// depends on these being exact.
+const (
+	HeaderTopGap    = 1 // blank rows above the "Paws" chip
+	HeaderToBodyGap = 0 // blank rows between "Paws" chip and the body
+	HelpBarHeight   = 1
+	PanelHeaderRows = 2 // panelHeader = chip row + separator row
+	TabsToListGap   = 2 // tab-bar row + blank row before first list row
 )

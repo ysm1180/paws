@@ -9,6 +9,8 @@ import (
 type Config struct {
 	PortHistory    map[string]map[string]int `json:"port_history"`
 	BastionHistory map[string]string         `json:"bastion_history"`
+	DownloadDir    string                    `json:"download_dir"`
+	EC2CwdHistory  map[string]string         `json:"ec2_cwd_history"`
 }
 
 func configPath() string {
@@ -20,6 +22,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		PortHistory:    map[string]map[string]int{"RDS": {}, "ElastiCache": {}},
 		BastionHistory: map[string]string{},
+		EC2CwdHistory:  map[string]string{},
 	}
 
 	data, err := os.ReadFile(configPath())
@@ -45,6 +48,13 @@ func Load() (*Config, error) {
 	}
 	if cfg.BastionHistory == nil {
 		cfg.BastionHistory = map[string]string{}
+	}
+	if cfg.EC2CwdHistory == nil {
+		cfg.EC2CwdHistory = map[string]string{}
+	}
+	if cfg.DownloadDir == "" {
+		home, _ := os.UserHomeDir()
+		cfg.DownloadDir = filepath.Join(home, "Downloads", "paws")
 	}
 
 	return cfg, nil
@@ -84,4 +94,23 @@ func (c *Config) GetSavedBastion(instanceID string) string {
 
 func (c *Config) SetBastion(instanceID, bastionID string) {
 	c.BastionHistory[instanceID] = bastionID
+}
+
+func (c *Config) GetEC2Cwd(instanceID string) string {
+	return c.EC2CwdHistory[instanceID]
+}
+
+func (c *Config) SetEC2Cwd(instanceID, cwd string) {
+	if c.EC2CwdHistory == nil {
+		c.EC2CwdHistory = map[string]string{}
+	}
+	c.EC2CwdHistory[instanceID] = cwd
+}
+
+func (c *Config) GetDownloadDir() string {
+	if c.DownloadDir == "" {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, "Downloads", "paws")
+	}
+	return c.DownloadDir
 }
