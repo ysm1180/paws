@@ -508,16 +508,55 @@ func (m *Model) renderFullView() string {
 	}
 
 	detailsHeight := 8
-	logsHeight := contentHeight / 4
-	if logsHeight < 5 {
-		logsHeight = 5
+
+	// Cap Instances at what its content actually needs (header + tabs +
+	// list rows + optional filter + optional hint), with a floor so the
+	// panel feels substantial even when only a few items are loaded.
+	// Without the cap the remainder math gave Instances every leftover
+	// row; without the floor a short list shrinks Instances to almost
+	// nothing.
+	instances := m.filteredInstances()
+	filterRows := 0
+	if m.inputMode == inputFilter || m.filterInput.Value() != "" {
+		filterRows = 1
 	}
-	instancesHeight := contentHeight - detailsHeight - logsHeight
-	if instancesHeight < 3 {
-		instancesHeight = 3
+	hintRows := 0
+	if m.activePanel == panelInstances {
+		hintRows = 1
+	}
+	const (
+		instancesChromeRows = 4 // panelHeader(2) + tabBar(2)
+		instancesAbsFloor   = 16
+		logsMin             = 8
+	)
+	// Floor: max(absolute floor, ~55% of body). 55% gives Instances the
+	// dominant share without re-introducing the old "fills the screen"
+	// problem on tall terminals.
+	instancesFloor := contentHeight * 55 / 100
+	if instancesFloor < instancesAbsFloor {
+		instancesFloor = instancesAbsFloor
+	}
+	roomForInstances := contentHeight - detailsHeight - logsMin
+	if instancesFloor > roomForInstances {
+		instancesFloor = roomForInstances
+	}
+	if instancesFloor < 9 {
+		instancesFloor = 9
+	}
+	needed := instancesChromeRows + len(instances) + filterRows + hintRows
+	if needed < instancesFloor {
+		needed = instancesFloor
+	}
+	instancesHeight := needed
+	if instancesHeight > roomForInstances {
+		instancesHeight = roomForInstances
+	}
+	logsHeight := contentHeight - detailsHeight - instancesHeight
+	if logsHeight < logsMin {
+		logsHeight = logsMin
 	}
 
-	instances := m.renderInstancesPanel(m.width, instancesHeight)
+	instancesPanel := m.renderInstancesPanel(m.width, instancesHeight)
 	details := m.renderDetailsPanel(m.width, detailsHeight)
 	logs := m.renderLogsPanel(m.width, logsHeight)
 
@@ -528,7 +567,7 @@ func (m *Model) renderFullView() string {
 		H: logsHeight,
 	}
 
-	body := lipgloss.JoinVertical(lipgloss.Left, instances, details, logs)
+	body := lipgloss.JoinVertical(lipgloss.Left, instancesPanel, details, logs)
 	helpBar := m.renderHelpBar()
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, helpBar)
@@ -633,7 +672,13 @@ func (m *Model) renderInstancesPanel(width, height int) string {
 	if m.inputMode == inputFilter || m.filterInput.Value() != "" {
 		filterHeight = 1
 	}
-	listHeight := height - 2 - tabsHeight - filterHeight
+	hintHeight := 0
+	if isFocused {
+		hintHeight = 1
+	}
+	// listHeight excludes the hint row so the bottom-anchored hint never
+	// overlaps the last list entry.
+	listHeight := height - 2 - tabsHeight - filterHeight - hintHeight
 	if listHeight < 3 {
 		listHeight = 3
 	}
@@ -703,20 +748,24 @@ func (m *Model) renderInstancesPanel(width, height int) string {
 
 	header := m.panelHeader("Instances", isFocused, width, scrollInfo)
 
-	body := tabBar + "\n" + listContent.String()
+	topBody := tabBar + "\n" + listContent.String()
 	if filterBar != "" {
-		body += "\n" + filterBar
+		topBody += "\n" + filterBar
 	}
-	if isFocused {
-		body += "\n" + renderPanelHint(panelInstances)
+	// Render the non-hint area at its full height first; this pads with
+	// blank rows below the list so the hint lands on the panel's last row
+	// instead of floating right under the list when it's short.
+	topBlock := fitBlock(topBody, width, height-2-hintHeight)
+	body := topBlock
+	if hintHeight > 0 {
+		body += "\n" + renderPanelHint(panelInstances, m.currentTab)
 	}
-	bodyBlock := fitBlock(body, width, height-2)
 
 	listStartAbsY := tabBarAbsY + TabsToListGap
 	m.instancesListRect = Region{X: 0, Y: listStartAbsY, W: width, H: listHeight}
 	m.instancesListRow0 = start
 
-	return header + "\n" + bodyBlock
+	return header + "\n" + body
 }
 
 func (m *Model) renderDetailsPanel(width, height int) string {
@@ -738,35 +787,52 @@ func (m *Model) renderDetailsPanel(width, height int) string {
 		}
 
 		content.WriteString(fmt.Sprintf(" %s %s\n", statusStyle.Render(statusIcon), ValueStyle.Render(inst.ID)))
+		if inst.Name != "" && inst.Name != inst.ID {
+			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Name:"), ValueStyle.Render(truncate(inst.Name, width-10))))
+		}
 		content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Type:"), ValueStyle.Render(inst.Type)))
-		content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Host:"), ValueStyle.Render(truncate(inst.Endpoint, width-10))))
-
-		portStyle := InlineInputStyle
-		if m.inputMode == inputPort {
-			portStyle = InlineInputFocusedStyle
+		if inst.Endpoint != "" {
+			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Host:"), ValueStyle.Render(truncate(inst.Endpoint, width-10))))
 		}
-		content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Port:"), portStyle.Render(m.portInput.View())))
 
-		bastionText := LabelStyle.Render("none")
-		if len(m.bastions) > 0 && m.bastionIdx < len(m.bastions) {
-			bastionText = ValueHighlightStyle.Render(truncate(m.bastions[m.bastionIdx].Name, width-12))
-		}
-		content.WriteString(fmt.Sprintf(" %s %s %s", LabelStyle.Render("Bastion:"), bastionText, LabelStyle.Render("[b]")))
+		// EC2 tab uses SSM file browser (Enter); port-forwarding fields
+		// don't apply, so hide them rather than show inputs that go nowhere.
+		if m.currentTab != tabEC2 {
+			portStyle := InlineInputStyle
+			if m.inputMode == inputPort {
+				portStyle = InlineInputFocusedStyle
+			}
+			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Port:"), portStyle.Render(m.portInput.View())))
 
-		if isActive {
-			port := m.pfManager.GetActivePort(inst.ID)
-			content.WriteString(fmt.Sprintf("\n %s", StatusConnectedStyle.Render(fmt.Sprintf("%s localhost:%d", IconSuccess, port))))
+			bastionText := LabelStyle.Render("none")
+			if len(m.bastions) > 0 && m.bastionIdx < len(m.bastions) {
+				bastionText = ValueHighlightStyle.Render(truncate(m.bastions[m.bastionIdx].Name, width-12))
+			}
+			content.WriteString(fmt.Sprintf(" %s %s %s", LabelStyle.Render("Bastion:"), bastionText, LabelStyle.Render("[b]")))
+
+			if isActive {
+				port := m.pfManager.GetActivePort(inst.ID)
+				content.WriteString(fmt.Sprintf("\n %s", StatusConnectedStyle.Render(fmt.Sprintf("%s localhost:%d", IconSuccess, port))))
+			}
 		}
 	}
 
 	header := m.panelHeader("Details", isFocused, width, "")
-	body := content.String()
+	hintStr := ""
 	if isFocused {
-		body += "\n" + renderPanelHint(panelDetails)
+		hintStr = renderPanelHint(panelDetails, m.currentTab)
 	}
-	bodyBlock := fitBlock(body, width, height-2)
+	hintHeight := 0
+	if hintStr != "" {
+		hintHeight = 1
+	}
+	topBlock := fitBlock(content.String(), width, height-2-hintHeight)
+	body := topBlock
+	if hintHeight > 0 {
+		body += "\n" + hintStr
+	}
 
-	return header + "\n" + bodyBlock
+	return header + "\n" + body
 }
 
 func (m *Model) renderLogsPanel(width, height int) string {
@@ -807,7 +873,7 @@ func (m *Model) renderLogsPanel(width, height int) string {
 
 	body := viewportBlock
 	if isFocused {
-		body += "\n" + renderPanelHint(panelLogs)
+		body += "\n" + renderPanelHint(panelLogs, m.currentTab)
 	}
 
 	// logsRect is owned by renderFullView (it knows the absolute Y).
