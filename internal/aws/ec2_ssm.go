@@ -64,6 +64,7 @@ func (c *Client) ListSsmManagedEC2Instances(ctx context.Context) ([]Instance, er
 				Type:          "EC2",
 				Platform:      platformByID[id],
 				SsmPingStatus: ping,
+				Region:        c.Region,
 			})
 		}
 	}

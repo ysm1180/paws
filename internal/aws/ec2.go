@@ -43,6 +43,7 @@ func (c *Client) ListEC2Instances(ctx context.Context) ([]Instance, error) {
 				Name:      name,
 				PrivateIP: privateIP,
 				Type:      "EC2",
+				Region:    c.Region,
 			})
 		}
 	}

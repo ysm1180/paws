@@ -24,6 +24,7 @@ func (c *Client) ListRDSInstances(ctx context.Context) ([]Instance, error) {
 			Endpoint: *db.Endpoint.Address,
 			Port:     int(*db.Endpoint.Port),
 			Type:     "RDS Instance",
+			Region:   c.Region,
 		})
 	}
 

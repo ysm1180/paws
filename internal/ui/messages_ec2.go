@@ -25,7 +25,10 @@ type browserOpenedMsg struct {
 
 // browserOpenFailedMsg is returned when StartShellSession or the initial ls
 // fails. Any sessions already opened are returned so Update can close them.
+// region identifies where those sessions live so TerminateSession reaches
+// the right regional endpoint.
 type browserOpenFailedMsg struct {
+	region   string
 	browseSh *aws.ShellSession
 	transSh  *aws.ShellSession
 	err      string

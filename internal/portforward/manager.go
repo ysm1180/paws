@@ -23,6 +23,10 @@ type Session struct {
 	BastionID    string
 	SessionInfo  *aws.SessionInfo
 	Process      *exec.Cmd
+	// client is the regional client this session was started with;
+	// reconnects must reuse it because a session lives in exactly one
+	// region (Manager.client only tracks the most recent Start).
+	client       *aws.Client
 	cancel       context.CancelFunc
 	reconnecting bool
 }
@@ -123,6 +127,7 @@ func (m *Manager) startSession(ctx context.Context, client *aws.Client, instance
 		BastionID:    bastionID,
 		SessionInfo:  sessionInfo,
 		Process:      cmd,
+		client:       client,
 		cancel:       cancel,
 		reconnecting: false,
 	}
@@ -230,7 +235,7 @@ func (m *Manager) handleSessionEnd(session *Session) {
 			return
 		}
 
-		err := m.startSession(m.ctx, m.client, session.InstanceType, session.InstanceID, session.Endpoint, session.LocalPort, session.RemotePort, session.BastionID, true)
+		err := m.startSession(m.ctx, session.client, session.InstanceType, session.InstanceID, session.Endpoint, session.LocalPort, session.RemotePort, session.BastionID, true)
 		if err == nil {
 			m.log(session.InstanceType, fmt.Sprintf("Successfully reconnected %s", session.InstanceID))
 			return

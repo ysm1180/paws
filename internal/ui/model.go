@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -17,6 +18,11 @@ import (
 	"github.com/ysm1180/paws/internal/portforward"
 	"github.com/ysm1180/paws/internal/transfer"
 )
+
+// extraRegions are always listed in addition to the AWS default region.
+// ap-northeast-1 is Tokyo; the default region (Seoul for the usual config
+// here) comes from the AWS config chain.
+var extraRegions = []string{"ap-northeast-1"}
 
 type tabType int
 
@@ -45,7 +51,8 @@ const (
 
 type Model struct {
 	ctx           context.Context
-	awsClient     *aws.Client
+	awsClients    map[string]*aws.Client
+	regions       []string
 	config        *config.Config
 	pfManager     *portforward.Manager
 	width         int
@@ -86,6 +93,9 @@ type instancesLoadedMsg struct {
 	ec       []aws.Instance
 	ec2      []aws.Instance
 	bastions []aws.Instance
+	// errs holds per-region load failures; a failing region must not hide
+	// the instances loaded from the others.
+	errs []string
 }
 
 type logMsg struct {
@@ -99,6 +109,20 @@ func NewModel(ctx context.Context) (*Model, error) {
 	client, err := aws.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AWS client: %w", err)
+	}
+
+	awsClients := map[string]*aws.Client{client.Region: client}
+	regions := []string{client.Region}
+	for _, region := range extraRegions {
+		if _, exists := awsClients[region]; exists {
+			continue
+		}
+		rc, err := aws.NewClientWithRegion(ctx, region)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create AWS client for %s: %w", region, err)
+		}
+		awsClients[region] = rc
+		regions = append(regions, region)
 	}
 
 	cfg, err := config.Load()
@@ -120,7 +144,8 @@ func NewModel(ctx context.Context) (*Model, error) {
 
 	m := &Model{
 		ctx:         ctx,
-		awsClient:   client,
+		awsClients:  awsClients,
+		regions:     regions,
 		config:      cfg,
 		width:       100,
 		height:      30,
@@ -155,28 +180,75 @@ func tickEvery() tea.Cmd {
 	})
 }
 
+// clientForRegion returns the regional client for an instance or bastion.
+// Everything reachable from the lists was loaded through one of the
+// configured clients; the default-region client is the fallback for an
+// empty or unknown region.
+func (m *Model) clientForRegion(region string) *aws.Client {
+	if c, ok := m.awsClients[region]; ok {
+		return c
+	}
+	return m.awsClients[m.regions[0]]
+}
+
+// loadInstances queries every configured region concurrently. A failure in
+// one region or service must not hide the instances that did load — errors
+// go to the log panel instead of failing the whole load.
 func (m *Model) loadInstances() tea.Msg {
-	rds, err := m.awsClient.ListRDSInstances(m.ctx)
-	if err != nil {
-		return errMsg{err}
+	type regionResult struct {
+		rds      []aws.Instance
+		ec       []aws.Instance
+		ec2      []aws.Instance
+		bastions []aws.Instance
+		errs     []string
 	}
 
-	ec, err := m.awsClient.ListElastiCacheInstances(m.ctx)
-	if err != nil {
-		return errMsg{err}
-	}
+	results := make([]regionResult, len(m.regions))
+	var wg sync.WaitGroup
+	for i, region := range m.regions {
+		client := m.awsClients[region]
+		if client == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, client *aws.Client) {
+			defer wg.Done()
+			res := &results[i]
+			ctx := m.ctx
 
-	bastions, err := m.awsClient.ListEC2Instances(m.ctx)
-	if err != nil {
-		return errMsg{err}
+			if rds, err := client.ListRDSInstances(ctx); err != nil {
+				res.errs = append(res.errs, fmt.Sprintf("%s RDS: %v", client.Region, err))
+			} else {
+				res.rds = rds
+			}
+			if ec, err := client.ListElastiCacheInstances(ctx); err != nil {
+				res.errs = append(res.errs, fmt.Sprintf("%s ElastiCache: %v", client.Region, err))
+			} else {
+				res.ec = ec
+			}
+			if bastions, err := client.ListEC2Instances(ctx); err != nil {
+				res.errs = append(res.errs, fmt.Sprintf("%s EC2: %v", client.Region, err))
+			} else {
+				res.bastions = bastions
+			}
+			if ec2, err := client.ListSsmManagedEC2Instances(ctx); err != nil {
+				res.errs = append(res.errs, fmt.Sprintf("%s EC2(SSM): %v", client.Region, err))
+			} else {
+				res.ec2 = ec2
+			}
+		}(i, client)
 	}
+	wg.Wait()
 
-	ec2, err := m.awsClient.ListSsmManagedEC2Instances(m.ctx)
-	if err != nil {
-		return errMsg{err}
+	msg := instancesLoadedMsg{}
+	for i := range results {
+		msg.rds = append(msg.rds, results[i].rds...)
+		msg.ec = append(msg.ec, results[i].ec...)
+		msg.ec2 = append(msg.ec2, results[i].ec2...)
+		msg.bastions = append(msg.bastions, results[i].bastions...)
+		msg.errs = append(msg.errs, results[i].errs...)
 	}
-
-	return instancesLoadedMsg{rds: rds, ec: ec, ec2: ec2, bastions: bastions}
+	return msg
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -197,7 +269,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.bastions = msg.bastions
 		m.loading = false
 		m.restoreSettings()
-		m.addLog("system", fmt.Sprintf("Loaded %d RDS, %d EC, %d EC2(SSM), %d EC2(all)", len(msg.rds), len(msg.ec), len(msg.ec2), len(msg.bastions)))
+		m.addLog("system", fmt.Sprintf("Loaded %d RDS, %d EC, %d EC2(SSM), %d EC2(all) from %d regions", len(msg.rds), len(msg.ec), len(msg.ec2), len(msg.bastions), len(m.regions)))
+		for _, loadErr := range msg.errs {
+			m.addLog("error", loadErr)
+		}
 
 	case logMsg:
 		m.addLog(msg.instanceType, msg.message)
@@ -216,15 +291,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.browser = newFileBrowserState(msg.instance, msg.cwd, msg.entries)
 
 	case browserOpenFailedMsg:
+		client := m.clientForRegion(msg.region)
 		if msg.browseSh != nil {
 			id := msg.browseSh.SessionID()
 			_ = msg.browseSh.Close()
-			_ = m.awsClient.TerminateSession(m.ctx, id)
+			_ = client.TerminateSession(m.ctx, id)
 		}
 		if msg.transSh != nil {
 			id := msg.transSh.SessionID()
 			_ = msg.transSh.Close()
-			_ = m.awsClient.TerminateSession(m.ctx, id)
+			_ = client.TerminateSession(m.ctx, id)
 		}
 		m.addLog("error", msg.err)
 
@@ -442,7 +518,7 @@ func (m *Model) renderCompactView() string {
 	} else {
 		for i := start; i < end; i++ {
 			inst := instances[i]
-			isActive := m.pfManager.IsActive(inst.ID)
+			isActive := m.pfManager.IsActive(inst.Key())
 			isSelected := i == m.cursor
 
 			icon := IconDisconnected
@@ -450,7 +526,7 @@ func (m *Model) renderCompactView() string {
 
 			if isActive {
 				icon = IconConnected
-				suffix = fmt.Sprintf(" :%d", m.pfManager.GetActivePort(inst.ID))
+				suffix = fmt.Sprintf(" :%d", m.pfManager.GetActivePort(inst.Key()))
 			}
 
 			line := formatInstanceRow(inst, icon, suffix, m.width)
@@ -514,7 +590,7 @@ func (m *Model) renderFullView() string {
 		contentHeight = 9
 	}
 
-	detailsHeight := 8
+	detailsHeight := 9
 
 	// Cap Instances at what its content actually needs (header + tabs +
 	// list rows + optional filter + optional hint), with a floor so the
@@ -612,8 +688,12 @@ func (m *Model) overlayBastionPopup(base string) string {
 			icon = IconSuccess
 		}
 
-		name := truncate(b.Name, popupWidth-8)
-		content.WriteString(style.Render(fmt.Sprintf("%s%s %s", prefix, icon, name)))
+		name := truncate(b.Name, popupWidth-8-len(regionLabel(b.Region)))
+		row := fmt.Sprintf("%s%s %s", prefix, icon, name)
+		if region := regionLabel(b.Region); region != "" {
+			row += "  " + LabelStyle.Render(region)
+		}
+		content.WriteString(style.Render(row))
 		if i < end-1 {
 			content.WriteString("\n")
 		}
@@ -714,14 +794,14 @@ func (m *Model) renderInstancesPanel(width, height int) string {
 	} else {
 		for i := start; i < end; i++ {
 			inst := instances[i]
-			isActive := m.pfManager.IsActive(inst.ID)
+			isActive := m.pfManager.IsActive(inst.Key())
 			isSelected := i == m.cursor
 
 			icon := IconDisconnected
 			suffix := ""
 			if isActive {
 				icon = IconConnected
-				suffix = fmt.Sprintf(" :%d", m.pfManager.GetActivePort(inst.ID))
+				suffix = fmt.Sprintf(" :%d", m.pfManager.GetActivePort(inst.Key()))
 			}
 
 			line := formatInstanceRow(inst, icon, suffix, rowWidth)
@@ -784,7 +864,7 @@ func (m *Model) renderDetailsPanel(width, height int) string {
 	if inst == nil {
 		content.WriteString(LabelStyle.Render(" No instance selected"))
 	} else {
-		isActive := m.pfManager.IsActive(inst.ID)
+		isActive := m.pfManager.IsActive(inst.Key())
 
 		statusIcon := IconDisconnected
 		statusStyle := StatusDisconnectedStyle
@@ -798,6 +878,13 @@ func (m *Model) renderDetailsPanel(width, height int) string {
 			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Name:"), ValueStyle.Render(truncate(inst.Name, width-10))))
 		}
 		content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Type:"), ValueStyle.Render(inst.Type)))
+		if inst.Region != "" {
+			regionText := inst.Region
+			if label := regionLabel(inst.Region); label != inst.Region {
+				regionText = fmt.Sprintf("%s (%s)", label, inst.Region)
+			}
+			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Region:"), ValueStyle.Render(regionText)))
+		}
 		if inst.Endpoint != "" {
 			content.WriteString(fmt.Sprintf(" %s %s\n", LabelStyle.Render("Host:"), ValueStyle.Render(truncate(inst.Endpoint, width-10))))
 		}
@@ -818,7 +905,7 @@ func (m *Model) renderDetailsPanel(width, height int) string {
 			content.WriteString(fmt.Sprintf(" %s %s %s", LabelStyle.Render("Bastion:"), bastionText, LabelStyle.Render("[b]")))
 
 			if isActive {
-				port := m.pfManager.GetActivePort(inst.ID)
+				port := m.pfManager.GetActivePort(inst.Key())
 				content.WriteString(fmt.Sprintf("\n %s", StatusConnectedStyle.Render(fmt.Sprintf("%s localhost:%d", IconSuccess, port))))
 			}
 		}
@@ -960,15 +1047,37 @@ func (m *Model) panelTitle(title string, focused bool) string {
 	return style.Render(title)
 }
 
-// formatInstanceRow renders one Instances row as "<name>  <id-dim><suffix>"
-// when Name differs from ID (EC2: ID is "i-…", Name is the Tag:Name) and as
-// just "<id><suffix>" otherwise. When the row is too narrow for both, the id
-// is dropped rather than the name truncated to nothing.
+// regionLabel shortens an AWS region to a city name; unknown regions
+// render as-is and an empty region renders as nothing.
+func regionLabel(region string) string {
+	switch region {
+	case "ap-northeast-2":
+		return "Seoul"
+	case "ap-northeast-1":
+		return "Tokyo"
+	}
+	return region
+}
+
+// formatInstanceRow renders one Instances row as
+// "<name>  <id-dim>  <region-dim><suffix>" when Name differs from ID (EC2:
+// ID is "i-…", Name is the Tag:Name) and as "<id>  <region-dim><suffix>"
+// otherwise. When the row is too narrow the id is dropped first, then the
+// name is truncated — the region label stays visible.
 func formatInstanceRow(inst aws.Instance, icon, suffix string, rowWidth int) string {
 	const rowChromeCells = 3 // " " + 1-cell icon + " "
-	const nameToIDGap = 2
+	const colGap = 2
 	const minNameCells = 8
-	avail := rowWidth - rowChromeCells - len(suffix)
+
+	region := regionLabel(inst.Region)
+	regionPart := ""
+	regionCells := 0
+	if region != "" {
+		regionPart = strings.Repeat(" ", colGap) + LabelStyle.Render(region)
+		regionCells = colGap + len(region)
+	}
+
+	avail := rowWidth - rowChromeCells - len(suffix) - regionCells
 	if avail < 1 {
 		avail = 1
 	}
@@ -980,13 +1089,13 @@ func formatInstanceRow(inst aws.Instance, icon, suffix string, rowWidth int) str
 		secondary = inst.ID
 	}
 
-	if secondary != "" && len(secondary)+nameToIDGap+minNameCells <= avail {
-		primaryMax := avail - nameToIDGap - len(secondary)
+	if secondary != "" && len(secondary)+colGap+minNameCells <= avail {
+		primaryMax := avail - colGap - len(secondary)
 		primary = truncate(primary, primaryMax)
-		return fmt.Sprintf(" %s %s  %s%s", icon, primary, LabelStyle.Render(secondary), suffix)
+		return fmt.Sprintf(" %s %s  %s%s%s", icon, primary, LabelStyle.Render(secondary), regionPart, suffix)
 	}
 	primary = truncate(primary, avail)
-	return fmt.Sprintf(" %s %s%s", icon, primary, suffix)
+	return fmt.Sprintf(" %s %s%s%s", icon, primary, regionPart, suffix)
 }
 
 // setTab also resets focus to the Instances list — Enter's open-browser
@@ -1052,13 +1161,23 @@ func (m *Model) restoreSettings() {
 		return
 	}
 
-	if savedPort := m.config.GetSavedPort(m.currentTabType(), inst.ID); savedPort > 0 {
+	// Region-aware keys first; plain IDs keep pre-multi-region settings
+	// working.
+	savedPort := m.config.GetSavedPort(m.currentTabType(), inst.Key())
+	if savedPort == 0 {
+		savedPort = m.config.GetSavedPort(m.currentTabType(), inst.ID)
+	}
+	if savedPort > 0 {
 		m.portInput.SetValue(strconv.Itoa(savedPort))
 	} else {
 		m.portInput.SetValue(strconv.Itoa(inst.Port))
 	}
 
-	if savedBastion := m.config.GetSavedBastion(inst.ID); savedBastion != "" {
+	savedBastion := m.config.GetSavedBastion(inst.Key())
+	if savedBastion == "" {
+		savedBastion = m.config.GetSavedBastion(inst.ID)
+	}
+	if savedBastion != "" {
 		for i, b := range m.bastions {
 			if b.ID == savedBastion {
 				m.bastionIdx = i
@@ -1073,7 +1192,7 @@ func (m *Model) saveBastion() {
 	if inst == nil || m.bastionIdx >= len(m.bastions) {
 		return
 	}
-	m.config.SetBastion(inst.ID, m.bastions[m.bastionIdx].ID)
+	m.config.SetBastion(inst.Key(), m.bastions[m.bastionIdx].ID)
 	m.config.Save()
 }
 
@@ -1094,11 +1213,12 @@ func (m *Model) startPortForwarding() tea.Msg {
 
 	bastion := m.bastions[m.bastionIdx]
 
-	m.config.SetPort(m.currentTabType(), inst.ID, localPort)
-	m.config.SetBastion(inst.ID, bastion.ID)
+	m.config.SetPort(m.currentTabType(), inst.Key(), localPort)
+	m.config.SetBastion(inst.Key(), bastion.ID)
 	m.config.Save()
 
-	err = m.pfManager.Start(m.ctx, m.awsClient, m.currentTabType(), inst.ID, inst.Endpoint, localPort, inst.Port, bastion.ID)
+	// The SSM session lives in the bastion's region, not the target's.
+	err = m.pfManager.Start(m.ctx, m.clientForRegion(bastion.Region), m.currentTabType(), inst.Key(), inst.Endpoint, localPort, inst.Port, bastion.ID)
 	if err != nil {
 		return logMsg{"error", err.Error()}
 	}
@@ -1112,7 +1232,7 @@ func (m *Model) stopPortForwarding() tea.Msg {
 		return logMsg{"error", "No instance selected"}
 	}
 
-	if err := m.pfManager.Stop(inst.ID); err != nil {
+	if err := m.pfManager.Stop(inst.Key()); err != nil {
 		return logMsg{"error", err.Error()}
 	}
 
@@ -1174,7 +1294,7 @@ func (m *Model) openBrowserCmd() tea.Cmd {
 	}
 	target := *inst
 	parentCtx := m.ctx
-	client := m.awsClient
+	client := m.clientForRegion(target.Region)
 	cfgCwd := m.config.GetEC2Cwd(target.ID)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
@@ -1182,11 +1302,12 @@ func (m *Model) openBrowserCmd() tea.Cmd {
 
 		bSh, err := client.StartShellSession(ctx, target.ID)
 		if err != nil {
-			return browserOpenFailedMsg{err: fmt.Sprintf("browse session: %v", err)}
+			return browserOpenFailedMsg{region: target.Region, err: fmt.Sprintf("browse session: %v", err)}
 		}
 		tSh, err := client.StartShellSession(ctx, target.ID)
 		if err != nil {
 			return browserOpenFailedMsg{
+				region:   target.Region,
 				browseSh: bSh,
 				err:      withStderr(fmt.Sprintf("transfer session: %v", err), bSh),
 			}
@@ -1198,6 +1319,7 @@ func (m *Model) openBrowserCmd() tea.Cmd {
 				// Surface this; falling back to "/" would mask the real
 				// first failure when a subsequent ls fails the same way.
 				return browserOpenFailedMsg{
+					region:   target.Region,
 					browseSh: bSh,
 					transSh:  tSh,
 					err:      withStderr(fmt.Sprintf("echo $HOME: %v", herr), bSh),
@@ -1211,6 +1333,7 @@ func (m *Model) openBrowserCmd() tea.Cmd {
 		entries, err := aws.ListRemoteDir(ctx, bSh, cwd)
 		if err != nil {
 			return browserOpenFailedMsg{
+				region:   target.Region,
 				browseSh: bSh,
 				transSh:  tSh,
 				err:      withStderr(fmt.Sprintf("ls %s: %v", cwd, err), bSh),
@@ -1238,7 +1361,7 @@ func (m *Model) reopenTransferShellCmd() tea.Cmd {
 	m.transferShell = nil
 	instanceID := m.browser.instance.ID
 	parentCtx := m.ctx
-	client := m.awsClient
+	client := m.clientForRegion(m.browser.instance.Region)
 	return func() tea.Msg {
 		if old != nil {
 			id := old.SessionID()
@@ -1268,16 +1391,20 @@ func withStderr(msg string, sh *aws.ShellSession) string {
 }
 
 func (m *Model) closeBrowserSessions() {
+	client := m.awsClients[m.regions[0]]
+	if m.browser != nil {
+		client = m.clientForRegion(m.browser.instance.Region)
+	}
 	if m.browseShell != nil {
 		id := m.browseShell.SessionID()
 		_ = m.browseShell.Close()
-		_ = m.awsClient.TerminateSession(m.ctx, id)
+		_ = client.TerminateSession(m.ctx, id)
 		m.browseShell = nil
 	}
 	if m.transferShell != nil {
 		id := m.transferShell.SessionID()
 		_ = m.transferShell.Close()
-		_ = m.awsClient.TerminateSession(m.ctx, id)
+		_ = client.TerminateSession(m.ctx, id)
 		m.transferShell = nil
 	}
 }

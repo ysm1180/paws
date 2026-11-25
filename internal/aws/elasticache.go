@@ -38,6 +38,7 @@ func (c *Client) ListElastiCacheInstances(ctx context.Context) ([]Instance, erro
 			Port:        int(*nodeGroup.PrimaryEndpoint.Port),
 			Type:        "ElastiCache (Redis/Valkey)",
 			Description: desc,
+			Region:      c.Region,
 		})
 	}
 
@@ -69,6 +70,7 @@ func (c *Client) ListElastiCacheInstances(ctx context.Context) ([]Instance, erro
 			Endpoint: *node.Endpoint.Address,
 			Port:     int(*node.Endpoint.Port),
 			Type:     fmt.Sprintf("ElastiCache (%s)", engine),
+			Region:   c.Region,
 		})
 	}
 
